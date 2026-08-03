@@ -1,0 +1,4 @@
+pandas
+cpca
+openpyxl
+tqdm
