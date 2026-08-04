@@ -2,15 +2,19 @@
 """
 中文地名脏数据清洗脚本
 功能：
-  1) 按逗号/顿号/分号/空格/加号/左右划线/中竖线拆分多地名
+  1) 按逗号/顿号/分号/空格/加号/划线/竖线及「及」「和」「与」拆分多地名
   2) 格式清洗 → 去重
   3) cpca 标准化（含裸区县后缀回退）
   4) 粘连地名检测（如「常州苏州杭州」→ 处理失败，交人工）
   5) 分离「不合规 / 处理失败」问题数据
 
-输出 result.xlsx 五列：
-  源数据 | 拆分片段 | 处理后数据 | 剩余问题数据 | 问题类型
+输出 result.xlsx 六列：
+  源数据 | 拆分片段 | 处理后数据 | 剩余问题数据 | 问题类型 | 应删除
 """
+# =========================
+# 依赖安装命令（如环境已装可跳过）
+# =========================
+# pip install pandas openpyxl tqdm cpca
 
 import re
 import sys
@@ -33,8 +37,9 @@ CPCA_BATCH_SIZE = 200
 # 粘连检测：去掉已识别省/市后，残留汉字数 ≥ 该阈值时进入二次判定
 RESIDUAL_THRESHOLD = 2
 
-# 拆分分隔符：中英文逗号、顿号、中英文分号、半角/全角空格
-_SPLIT_PATTERN = re.compile(r"[，,、；; 　+/\\|]+")
+# 拆分分隔符：中英文逗号、顿号、中英文分号、半角/全角空格、+ / \ |
+# 以及连接词「及」「和」「与」（注意：含「和」的地名如「和田/和县」会被误拆，见 README 注意事项）
+_SPLIT_PATTERN = re.compile(r"[，.,、；;： 　+/\\|及和与-]+")
 # 段首尾剥离的轻量标点（句号等不作分隔符，只去掉）
 _EDGE_PUNCT_PATTERN = re.compile(
     r"^[\s　。．.、，,；;：:！!？?]+|[\s　。．.、，,；;：:！!？?]+$"
@@ -95,8 +100,8 @@ def normalize_source(raw) -> str:
 def split_raw_to_segments(raw_text: str) -> list:
     """
     按审批规则拆分多地名：
-    分隔符：， , 、 ； ; 空格 全角空格
-    不因「等/及」拆分；段首尾去掉句号等轻量标点。
+    分隔符：， , 、 ； ; 空格 全角空格 + / \\ | 及「及」「和」「与」
+    不因「等」拆分；段首尾去掉句号等轻量标点。
     """
     if not raw_text:
         return []
@@ -335,13 +340,76 @@ def is_glue_or_partial(original, province, city, district=None) -> bool:
     return True
 
 
+# 单字行政区划后缀，用于粘连解析时清理消费点残留的孤立后缀字
+_SINGLE_SUFFIX_CHARS = set("市县区省州盟旗")
+
+
+def greedy_split_locations(name: str, batch_size=50):
+    """
+    贪心粘连解析：从左往右逐个消费最左可解析地名。
+
+    思路：对剩余串，从最短可能地名（2 字）递增尝试，取「能解析成合法省/市的
+    最短前缀」作为本轮消费对象，记录结果后从剩余串删除，继续处理剩下的部分。
+
+    返回 dict：
+      {"ok": True,  "consumed": [(片段, 标准化结果), ...], "remaining": ""}
+      {"ok": False, "consumed": [...已消费...], "remaining": 剩余无法解析的文本}
+    全部消费完 → ok=True；中途解不动 → ok=False（remaining 为解不动的剩余）。
+    """
+    remaining = name
+    consumed = []  # [(segment, processed), ...]
+    for _ in range(len(name) // 2 + 1):
+        if not remaining:
+            return {"ok": True, "consumed": consumed, "remaining": remaining}
+        found = False
+        for L in range(2, len(remaining) + 1):
+            prefix = remaining[:L]
+            processed, _, _, _, _ = _try_resolve_one_name(prefix, batch_size)
+            if processed:
+                consumed.append((prefix, processed))
+                remaining = remaining[L:]
+                # 清理消费点后残留的孤立后缀字，如「常州市苏州市」消费「常州」后剩「市苏州市」
+                while remaining and remaining[0] in _SINGLE_SUFFIX_CHARS:
+                    remaining = remaining[1:]
+                found = True
+                break
+        if not found:
+            # 剩余部分解不动 → 失败，返回已消费信息供上层判断「应删除」
+            return {"ok": False, "consumed": consumed, "remaining": remaining}
+    return {"ok": True, "consumed": consumed, "remaining": remaining}
+
+
+def _handle_glue(name: str) -> list:
+    """
+    对粘连段：先尝试贪心拆，能全消费则多行成功，否则处理失败。
+    处理失败时，若「首个有效城市之后的剩余文本长度 ≥ 2」，标注应删除=是。
+    """
+    result = greedy_split_locations(name)
+    if result["ok"] and result["consumed"]:
+        return [
+            {"kind": "ok", "segment": seg, "processed": processed}
+            for seg, processed in result["consumed"]
+        ]
+    # 粘连拆不动 → 处理失败
+    should_delete = bool(result["consumed"]) and len(result["remaining"]) >= 2
+    return [
+        {
+            "kind": "issue",
+            "issue": ISSUE_FAILED,
+            "problem": name,
+            "delete": should_delete,
+        }
+    ]
+
+
 def resolve_locations(unique_cleaned, batch_size=200):
     """
-    cpca 标准化 + 裸区县后缀回退 + 粘连残留检测。
+    cpca 标准化 + 裸区县后缀回退 + 粘连贪心解析。
 
-    返回 list[dict | None]：
-      成功: {"processed": "四川省成都市", ...}
-      粘连: {"issue": "处理失败", "problem": 原文}
+    返回 list[list[dict] | None]：
+      成功: [{"kind": "ok", "processed": "四川省成都市"}, ...]
+      粘连拆开: [{"kind": "ok", ...}, {"kind": "ok", ...}]（多行）
+      粘连拆不动: [{"kind": "issue", "issue": "处理失败", "problem": 原文}]
       失败: None  （外层再标「不合规」）
     """
     total = len(unique_cleaned)
@@ -375,17 +443,12 @@ def resolve_locations(unique_cleaned, batch_size=200):
             if is_glue_or_partial(
                 name, row[province_col], row[city_col], district
             ):
-                results[i] = {
-                    "issue": ISSUE_FAILED,
-                    "problem": name,
-                    "processed": None,
-                }
+                # 粘连：尝试贪心拆多行，拆不动才处理失败
+                results[i] = _handle_glue(name)
             else:
-                results[i] = {
-                    "issue": None,
-                    "problem": None,
-                    "processed": processed,
-                }
+                results[i] = [
+                    {"kind": "ok", "segment": name, "processed": processed}
+                ]
         else:
             if name and not _ends_with_admin_suffix(name):
                 pending_indices.append(i)
@@ -414,17 +477,11 @@ def resolve_locations(unique_cleaned, batch_size=200):
                     if is_glue_or_partial(
                         name, row[province_col], row[city_col], district
                     ):
-                        results[global_idx] = {
-                            "issue": ISSUE_FAILED,
-                            "problem": name,
-                            "processed": None,
-                        }
+                        results[global_idx] = _handle_glue(name)
                     else:
-                        results[global_idx] = {
-                            "issue": None,
-                            "problem": None,
-                            "processed": processed,
-                        }
+                        results[global_idx] = [
+                            {"kind": "ok", "segment": name, "processed": processed}
+                        ]
                 else:
                     next_pending.append(global_idx)
             still_pending = next_pending
@@ -549,34 +606,52 @@ def main():
                     "处理后数据": "",
                     "剩余问题数据": cleaned,
                     "问题类型": pre_issue[cleaned],
+                    "应删除": "",
                 }
             )
             continue
 
         result = resolve_map.get(cleaned)
 
-        if result and result.get("processed"):
-            success_rows.append(
-                {
-                    "源数据": source,
-                    "拆分片段": cleaned,
-                    "处理后数据": result["processed"],
-                    "剩余问题数据": "",
-                    "问题类型": "",
-                    "_sort_key": result["processed"],
-                }
-            )
-        elif result and result.get("issue") == ISSUE_FAILED:
-            # 粘连：处理失败，交人工
-            problem_rows.append(
-                {
-                    "源数据": source,
-                    "拆分片段": cleaned,
-                    "处理后数据": "",
-                    "剩余问题数据": result.get("problem") or cleaned,
-                    "问题类型": ISSUE_FAILED,
-                }
-            )
+        if result:
+            # result 为 list：可能是单个成功，或多个成功（粘连拆开），或问题
+            for item in result:
+                if item.get("kind") == "ok" and item.get("processed"):
+                    success_rows.append(
+                        {
+                            "源数据": source,
+                            "拆分片段": item.get("segment") or cleaned,
+                            "处理后数据": item["processed"],
+                            "剩余问题数据": "",
+                            "问题类型": "",
+                            "应删除": "",
+                            "_sort_key": item["processed"],
+                        }
+                    )
+                elif item.get("issue") == ISSUE_FAILED:
+                    # 粘连：处理失败，交人工
+                    problem_rows.append(
+                        {
+                            "源数据": source,
+                            "拆分片段": cleaned,
+                            "处理后数据": "",
+                            "剩余问题数据": item.get("problem") or cleaned,
+                            "问题类型": ISSUE_FAILED,
+                            "应删除": "是" if item.get("delete") else "",
+                        }
+                    )
+                else:
+                    # 完全无法识别：不合规
+                    problem_rows.append(
+                        {
+                            "源数据": source,
+                            "拆分片段": cleaned,
+                            "处理后数据": "",
+                            "剩余问题数据": cleaned,
+                            "问题类型": ISSUE_INVALID,
+                            "应删除": "",
+                        }
+                    )
         else:
             # 完全无法识别：不合规
             problem_rows.append(
@@ -586,6 +661,7 @@ def main():
                     "处理后数据": "",
                     "剩余问题数据": cleaned,
                     "问题类型": ISSUE_INVALID,
+                    "应删除": "",
                 }
             )
 
@@ -604,6 +680,7 @@ def main():
                 "处理后数据": row["处理后数据"],
                 "剩余问题数据": row["剩余问题数据"],
                 "问题类型": row["问题类型"],
+                "应删除": row["应删除"],
             }
         )
     for row in problem_rows:
@@ -611,7 +688,7 @@ def main():
 
     result_df = pd.DataFrame(
         result_records,
-        columns=["源数据", "拆分片段", "处理后数据", "剩余问题数据", "问题类型"],
+        columns=["源数据", "拆分片段", "处理后数据", "剩余问题数据", "问题类型", "应删除"],
     )
 
     # ---------- 写出 ----------
@@ -639,6 +716,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
