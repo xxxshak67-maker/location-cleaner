@@ -32,10 +32,12 @@ INPUT_FILE = r"./examples/dirty_data.xlsx"   # 输入 Excel 文件路径
 OUTPUT_FILE = r"./examples/result.xlsx"      # 输出 Excel 文件路径
 # 读取工作表：默认第一个表；如需指定可改为表名字符串，如 "Sheet1"
 SHEET_NAME = 0
-# cpca 分批转换大小（便于显示进度条；数据量不大时可改大）
+    # cpca 分批转换大小（便于显示进度条；数据量不大时可改大）
 CPCA_BATCH_SIZE = 200
 # 粘连检测：去掉已识别省/市后，残留汉字数 ≥ 该阈值时进入二次判定
 RESIDUAL_THRESHOLD = 2
+# 热力图输出路径（依赖 folium；未安装时优雅降级，不影响主流程）
+HEATMAP_FILE = r"./examples/heatmap.html"   # 输出热力图 HTML 路径
 
 # 拆分分隔符：中英文逗号、顿号、中英文分号、半角/全角空格、+ / \ |
 # 以及连接词「及」「和」「与」（注意：含「和」的地名如「和田/和县」会被误拆，见 README 注意事项）
@@ -252,11 +254,13 @@ def _get_cols(cpca_df):
     city_col = col_map.get("市")
     district_col = col_map.get("区")
     address_col = col_map.get("地址")
+    adcode_col = col_map.get("adcode")
     if province_col is None or city_col is None:
         raise RuntimeError(
             f"cpca 返回列异常，当前列名：{list(cpca_df.columns)}，期望包含「省」「市」"
         )
-    return province_col, city_col, district_col, address_col
+    # address_col 当前仅保留列名解析，未使用
+    return province_col, city_col, district_col, address_col, adcode_col
 
 
 def _batch_cpca(names, batch_size):
@@ -272,14 +276,14 @@ def _batch_cpca(names, batch_size):
 def _try_resolve_one_name(name: str, batch_size=50):
     """
     尝试解析单个地名：原文 + 后缀回退。
-    返回 (processed_str_or_None, province, city, district, address)
+    返回 (processed_str_or_None, province, city, district, address, adcode)
     """
     candidates = [name]
     if name and not _ends_with_admin_suffix(name):
         candidates.extend(name + s for s in _FALLBACK_SUFFIXES)
 
     df = _batch_cpca(candidates, batch_size)
-    province_col, city_col, district_col, address_col = _get_cols(df)
+    province_col, city_col, district_col, address_col, adcode_col = _get_cols(df)
 
     for i in range(len(candidates)):
         row = df.iloc[i]
@@ -287,14 +291,20 @@ def _try_resolve_one_name(name: str, batch_size=50):
         if processed:
             district = row[district_col] if district_col is not None else None
             address = row[address_col] if address_col is not None else None
+            adcode = row[adcode_col] if adcode_col is not None else None
+            try:
+                adcode = str(adcode) if pd.notna(adcode) else None
+            except Exception:
+                adcode = None
             return (
                 processed,
                 row[province_col],
                 row[city_col],
                 district,
                 address,
+                adcode,
             )
-    return None, None, None, None, None
+    return None, None, None, None, None, None
 
 
 def is_glue_or_partial(original, province, city, district=None) -> bool:
@@ -314,7 +324,7 @@ def is_glue_or_partial(original, province, city, district=None) -> bool:
         return False
 
     # 残留再解析：是否另一个行政区
-    re_processed, _, re_city, _, _ = _try_resolve_one_name(residual)
+    re_processed, _, re_city, _, _, _ = _try_resolve_one_name(residual)
     if re_processed:
         parent = format_region(province, city)
         # 同一省+市（区县细节）→ 允许成功
@@ -352,21 +362,21 @@ def greedy_split_locations(name: str, batch_size=50):
     最短前缀」作为本轮消费对象，记录结果后从剩余串删除，继续处理剩下的部分。
 
     返回 dict：
-      {"ok": True,  "consumed": [(片段, 标准化结果), ...], "remaining": ""}
+      {"ok": True,  "consumed": [(片段, 标准化结果, adcode), ...], "remaining": ""}
       {"ok": False, "consumed": [...已消费...], "remaining": 剩余无法解析的文本}
     全部消费完 → ok=True；中途解不动 → ok=False（remaining 为解不动的剩余）。
     """
     remaining = name
-    consumed = []  # [(segment, processed), ...]
+    consumed = []  # [(segment, processed, adcode), ...]
     for _ in range(len(name) // 2 + 1):
         if not remaining:
             return {"ok": True, "consumed": consumed, "remaining": remaining}
         found = False
         for L in range(2, len(remaining) + 1):
             prefix = remaining[:L]
-            processed, _, _, _, _ = _try_resolve_one_name(prefix, batch_size)
+            processed, _, _, _, _, adcode = _try_resolve_one_name(prefix, batch_size)
             if processed:
-                consumed.append((prefix, processed))
+                consumed.append((prefix, processed, adcode))
                 remaining = remaining[L:]
                 # 清理消费点后残留的孤立后缀字，如「常州市苏州市」消费「常州」后剩「市苏州市」
                 while remaining and remaining[0] in _SINGLE_SUFFIX_CHARS:
@@ -387,8 +397,8 @@ def _handle_glue(name: str) -> list:
     result = greedy_split_locations(name)
     if result["ok"] and result["consumed"]:
         return [
-            {"kind": "ok", "segment": seg, "processed": processed}
-            for seg, processed in result["consumed"]
+            {"kind": "ok", "segment": seg, "processed": processed, "adcode": adcode}
+            for seg, processed, adcode in result["consumed"]
         ]
     # 粘连拆不动 → 处理失败
     should_delete = bool(result["consumed"]) and len(result["remaining"]) >= 2
@@ -428,7 +438,7 @@ def resolve_locations(unique_cleaned, batch_size=200):
             f"cpca 返回行数与输入不一致：输入 {total}，返回 {len(cpca_df)}"
         )
 
-    province_col, city_col, district_col, *_ = _get_cols(cpca_df)
+    province_col, city_col, district_col, address_col, adcode_col = _get_cols(cpca_df)
 
     results = [None] * total
     pending_indices = []
@@ -438,6 +448,9 @@ def resolve_locations(unique_cleaned, batch_size=200):
         processed = parse_region_from_row(row, province_col, city_col)
         name = unique_cleaned[i]
         district = row[district_col] if district_col is not None else None
+        adcode = (
+            str(row[adcode_col]) if adcode_col is not None and pd.notna(row[adcode_col]) else None
+        )
 
         if processed:
             if is_glue_or_partial(
@@ -447,7 +460,7 @@ def resolve_locations(unique_cleaned, batch_size=200):
                 results[i] = _handle_glue(name)
             else:
                 results[i] = [
-                    {"kind": "ok", "segment": name, "processed": processed}
+                    {"kind": "ok", "segment": name, "processed": processed, "adcode": adcode}
                 ]
         else:
             if name and not _ends_with_admin_suffix(name):
@@ -471,6 +484,11 @@ def resolve_locations(unique_cleaned, batch_size=200):
                 row = retry_df.iloc[local_idx]
                 processed = parse_region_from_row(row, province_col, city_col)
                 name = unique_cleaned[global_idx]
+                retry_adcode = (
+                    str(row[adcode_col])
+                    if adcode_col is not None and pd.notna(row[adcode_col])
+                    else None
+                )
                 if processed:
                     district = row[district_col] if district_col is not None else None
                     # 残留检测仍基于「清洗后原文」，不是带后缀的查询串
@@ -480,7 +498,12 @@ def resolve_locations(unique_cleaned, batch_size=200):
                         results[global_idx] = _handle_glue(name)
                     else:
                         results[global_idx] = [
-                            {"kind": "ok", "segment": name, "processed": processed}
+                            {
+                                "kind": "ok",
+                                "segment": name,
+                                "processed": processed,
+                                "adcode": retry_adcode,
+                            }
                         ]
                 else:
                     next_pending.append(global_idx)
@@ -541,6 +564,39 @@ def expand_raw_rows(raw_values):
                 pairs.append((source, cleaned))
 
     return pairs
+
+
+def try_draw_heatmap(success_rows: list, heatmap_file: str):
+    """
+    利用 cpca.drawer 对成功识别的地名生成地理位置热力图。
+
+    - 收集所有成功行的 adcode，调用 cpca.drawer.draw_locations。
+    - folium 未安装时优雅降级，打印安装提示，不中断主流程。
+    - 无成功 adcode 时提示并跳过。
+    """
+    adcodes = [
+        row.get("_adcode") for row in success_rows if row.get("_adcode")
+    ]
+    if not adcodes:
+        print("[提示] 无成功识别的地名，跳过热力图生成。")
+        return
+
+    try:
+        import folium  # noqa: F401  # pylint: disable=unused-import
+    except (ImportError, ModuleNotFoundError):
+        print(
+            "[提示] 缺少 folium，跳过热力图。"
+            "如需热力图，请安装：pip install folium"
+        )
+        return
+
+    try:
+        from cpca.drawer import draw_locations
+
+        draw_locations(adcodes, heatmap_file)
+        print(f"[热力图] 已保存至：{Path(heatmap_file).resolve()}")
+    except Exception as exc:
+        print(f"[提示] 热力图生成失败（不影响主流程）：{exc}")
 
 
 def main():
@@ -626,6 +682,7 @@ def main():
                             "问题类型": "",
                             "应删除": "",
                             "_sort_key": item["processed"],
+                            "_adcode": item.get("adcode"),
                         }
                     )
                 elif item.get("issue") == ISSUE_FAILED:
@@ -711,6 +768,11 @@ def main():
     print(f"不合规数：{invalid_count}")
     print(f"处理失败数：{failed_count}")
     print(f"剩余问题合计：{invalid_count + failed_count}")
+
+    # ---------- 热力图 ----------
+    print("-" * 50)
+    try_draw_heatmap(success_rows, HEATMAP_FILE)
+
     print("=" * 50)
 
 

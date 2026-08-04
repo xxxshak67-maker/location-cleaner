@@ -52,11 +52,12 @@ pip install pandas openpyxl tqdm cpca
 2. 在 `location_cleaner.py` 顶部按需修改配置：
 
    ```python
-   INPUT_FILE   = r"./examples/dirty_data.xlsx"   # 输入文件
-   OUTPUT_FILE  = r"./examples/result.xlsx"       # 输出文件
-   SHEET_NAME   = 0                    # 读取的工作表
-   CPCA_BATCH_SIZE  = 200              # cpca 分批大小
+   INPUT_FILE         = r"./examples/dirty_data.xlsx"   # 输入文件
+   OUTPUT_FILE        = r"./examples/result.xlsx"       # 输出文件
+   SHEET_NAME         = 0                    # 读取的工作表
+   CPCA_BATCH_SIZE    = 200              # cpca 分批大小
    RESIDUAL_THRESHOLD = 2              # 粘连检测残留阈值
+   HEATMAP_FILE       = r"./examples/heatmap.html"  # 热力图输出（可选）
    ```
 
 3. 运行：
@@ -65,7 +66,19 @@ pip install pandas openpyxl tqdm cpca
    python location_cleaner.py
    ```
 
-4. 完成后查看 `result.xlsx` 与终端统计（总数 / 成功数 / 不合规数 / 处理失败数）。
+4. 完成后查看产物：
+   - `result.xlsx`：清洗结果与问题统计
+   - `heatmap.html`：交互式地理位置热力图（浏览器打开；若未安装 folium 则跳过）
+   - 终端统计：总数 / 成功数 / 不合规数 / 处理失败数
+
+## 热力图
+
+运行完成后，脚本会生成 `heatmap.html`，在浏览器中打开即可看到识别成功的地名在全国地图上的**热力分布**。
+
+- 基于 `cpca.drawer.draw_locations` + folium（Leaflet）实现，每个成功识别的地名对应一个热力点。
+- 无需额外地理编码：cpca 内部通过 `adcode`（行政区划代码）自动定位经纬度。
+- `folium` 为可选依赖：未安装时自动跳过，不影响清洗主流程，终端会提示安装方式。
+- 无成功识别数据时，不生成热力图并打印提示。
 
 ## 处理规则速览
 
@@ -79,7 +92,7 @@ pip install pandas openpyxl tqdm cpca
 | `成都及乐山` | `四川省成都市` / `四川省乐山市` | 连接词「及/和/与」可拆分 |
 | `贵州等` | 不合规 | 含「等/等等」 |
 | `常州苏州杭州` | `江苏省常州市` / `江苏省苏州市` / `浙江省杭州市` | 粘连 → 贪心逐段拆开 |
-| `眉山青白江及什邡` | 处理失败（应删除=是） | 粘连但部分解不动，交人工 |
+| `眉山东南车站和什邡` | 处理失败（应删除=是） | 粘连但部分解不动，交人工 |
 | `交子公园` | 不合规 | POI，无法识别 |
 
 ## 注意事项
@@ -96,7 +109,7 @@ location-cleaner/
 ├── README.md
 ├── LICENSE
 └── .gitignore
-└── examples/               # 示例数据（可选但推荐）
+└── examples/
     ├── dirty_data.xlsx
     └── result.xlsx
 ```

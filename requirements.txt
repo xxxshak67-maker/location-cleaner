@@ -2,3 +2,4 @@ pandas
 cpca
 openpyxl
 tqdm
+folium  # 热力图绘制（可选）
