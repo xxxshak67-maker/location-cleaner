@@ -28,8 +28,8 @@ from tqdm import tqdm
 # =========================
 # 可配置路径（按需修改）
 # =========================
-INPUT_FILE = r"dirty_data.xlsx"   # 输入 Excel 文件路径
-OUTPUT_FILE = r"result.xlsx"      # 输出 Excel 文件路径
+INPUT_FILE = r"./examples/dirty_data.xlsx"   # 输入 Excel 文件路径
+OUTPUT_FILE = r"./examples/result.xlsx"      # 输出 Excel 文件路径
 # 读取工作表：默认第一个表；如需指定可改为表名字符串，如 "Sheet1"
 SHEET_NAME = 0
 # cpca 分批转换大小（便于显示进度条；数据量不大时可改大）
